@@ -25,6 +25,7 @@
 package com.isaklab.libg2sdrk
 
 import android.util.Log
+import com.isaklab.isdrdrivers.core.DspThread
 import com.isaklab.isdrdrivers.core.FFTProcessor
 import com.isaklab.isdrdrivers.core.SpectrumWorker
 import com.isaklab.isdrdrivers.core.FloatRing
@@ -84,8 +85,11 @@ class G2Client(
     @Volatile var spectrumEnabled: Boolean = true
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var receiveJob: Job? = null
-    private var txSenderJob: Job? = null
+    // Hot loops on threads of their own (see DspThread): a shared coroutine
+    // pool leaked their audio priority and hopped them between workers on
+    // every paced beat.
+    private var receiveThread: Thread? = null
+    private var txSenderThread: Thread? = null
     private var keepaliveJob: Job? = null
     private var socket: DatagramSocket? = null
     private var radio: InetAddress? = null
@@ -191,11 +195,14 @@ class G2Client(
                 synchronized(stateLock) { state.run = false; state.mox = false }
                 sendHighPriority()
             } catch (_: Exception) {}
-            receiveJob?.cancel()
-            txSenderJob?.cancel()
             keepaliveJob?.cancel()
-            spectrumWorker?.stop()
+            // The socket is what unblocks the receive loop; close it first.
             socket?.close()
+            DspThread.stop(receiveThread)
+            DspThread.stop(txSenderThread)
+            receiveThread = null
+            txSenderThread = null
+            spectrumWorker?.stop()
             socket = null
             onConnectionStatusChanged(false, "Disconnected")
         }
@@ -233,18 +240,13 @@ class G2Client(
     // ========================================================================
 
     private fun startReceiving() {
-        receiveJob = scope.launch {
-            // Audio priority: block delivery must not lose CPU to rendering.
-            try {
-                android.os.Process.setThreadPriority(
-                    android.os.Process.THREAD_PRIORITY_URGENT_AUDIO
-                )
-            } catch (_: Throwable) {}
+        // Audio priority: block delivery must not lose CPU to rendering.
+        receiveThread = DspThread.start("g2-rx", DspThread.PRIORITY_RADIO) {
             spectrumWorker?.start()
             val buf = ByteArray(2048)
             val packet = DatagramPacket(buf, buf.size)
             var noData = 0
-            while (running && isActive) {
+            while (running) {
                 try {
                     socket!!.receive(packet)
                     noData = 0
@@ -400,14 +402,17 @@ class G2Client(
      * client simply stalls, which starves the DUC the same way).
      */
     private fun startTxSender() {
-        txSenderJob = scope.launch {
+        txSenderThread = DspThread.start("g2-tx", DspThread.PRIORITY_RADIO) {
             var txStartNs = 0L
             var packetsSent = 0L
-            while (running && isActive) {
+            while (running) {
                 val transmitting = synchronized(stateLock) { state.mox }
                 if (!transmitting) {
+                    // Idle: nothing is sent from here (the keepalive owns the
+                    // watchdog), so there is no reason to wake 333 times a
+                    // second just to look at a flag.
                     txStartNs = 0L
-                    delay(3)
+                    DspThread.pace(System.nanoTime() + 10_000_000L)
                     continue
                 }
                 val now = System.nanoTime()
@@ -424,7 +429,7 @@ class G2Client(
                         burst++
                     }
                 }
-                delay(1)
+                DspThread.pace(System.nanoTime() + 500_000L)
             }
         }
     }
