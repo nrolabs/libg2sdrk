@@ -46,14 +46,26 @@ class TxInterpolator(
         }
     }
 
+    /**
+     * Resets the internal polyphase history buffers. This should be called
+     * prior to beginning a new transmission stream to ensure no residual
+     * samples from previous keying events pollute the output.
+     */
     fun reset() {
         histI.fill(0f)
         histQ.fill(0f)
     }
 
     /**
-     * Feed one 48 k IQ pair and write [factor] interpolated 192 k pairs as
-     * interleaved floats into [out] at [offset]. Returns the next offset.
+     * Feeds one 48 kS/s complex IQ pair into the interpolator and writes [factor]
+     * upsampled, 192 kS/s board-rate pairs as interleaved floats into the provided [out] array.
+     * The polyphase branch convolutions are completely allocation-free.
+     *
+     * @param i Real (in-phase) part of the input sample.
+     * @param q Imaginary (quadrature) part of the input sample.
+     * @param out The destination array for the upsampled samples.
+     * @param offset The starting index in the destination array.
+     * @return The updated index offset within the destination array.
      */
     fun process(i: Float, q: Float, out: FloatArray, offset: Int): Int {
         for (k in tapsPerPhase - 1 downTo 1) {

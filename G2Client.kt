@@ -151,6 +151,13 @@ class G2Client(
     // Connection lifecycle
     // ========================================================================
 
+    /**
+     * Discovers the Saturn radio on the LAN (if broadcast), binds the UDP socket,
+     * and sets up the Protocol-2 streaming topology. Allocates high-priority processing
+     * threads for stream ingest and transmit pacing.
+     *
+     * @return true if successfully connected and initialized, false otherwise.
+     */
     suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
         try {
             onConnectionStatusChanged(false, "Discovering…")
@@ -188,6 +195,10 @@ class G2Client(
         }
     }
 
+    /**
+     * Releases the UDP socket and safely terminates the RX, TX, and keepalive background
+     * coroutines/threads. The radio is commanded to unkey and stop sending DDC streams.
+     */
     fun disconnect() {
         scope.launch {
             running = false
@@ -497,6 +508,10 @@ class G2Client(
     // Public control API (mirrors the sibling clients)
     // ========================================================================
 
+    /**
+     * Tunes the primary DDC (DDC0) to the specified frequency in Hz.
+     * Enqueues a high-priority command and resets the FFT smoothing filter.
+     */
     fun setFrequency(hz: Long) {
         synchronized(stateLock) { state.ddcFreqHz[0] = hz }
         sendHighPriority()
@@ -513,6 +528,10 @@ class G2Client(
         if (index == activeReceiver) spectrumWorker?.resetSmoothing()
     }
 
+    /**
+     * Sets the sampling rate for the active DDCs. Supported Protocol-2 rates are 
+     * 48, 96, 192, 384, 768, and 1536 kHz. Invalid values fallback to 48 kHz.
+     */
     fun setSampleRate(hz: Int) {
         synchronized(stateLock) {
             state.sampleRate = if (hz in G2Protocol.SAMPLE_RATES) hz else 48_000
@@ -522,8 +541,10 @@ class G2Client(
         spectrumWorker?.resetSmoothing()
     }
 
-    // Saturn streams up to 7 DDCs (source ports 1035..1041) — no artificial
-    // 2-RX cap; the DDC enable mask and per-DDC config frame by the count.
+    /**
+     * Configures the number of parallel DDCs to stream from the radio (up to 7).
+     * The hardware automatically multiplexes the streams to ports 1035+.
+     */
     fun setReceiverCount(n: Int) {
         synchronized(stateLock) { state.receiverCount = n.coerceIn(1, MAX_RECEIVERS) }
         sendRxSpecific()

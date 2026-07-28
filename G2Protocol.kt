@@ -170,6 +170,9 @@ object G2Protocol {
     /**
      * General packet (port 1024): advertises the port plan and global config.
      * Sent at start (and every 500 ms if [ControlState.watchdogEnabled]).
+     *
+     * @param state The global state object containing PA and watchdog configuration.
+     * @return The 60-byte serialized general packet.
      */
     fun generalPacket(state: ControlState): ByteArray {
         val p = ByteArray(60)
@@ -212,6 +215,14 @@ object G2Protocol {
     fun phaseWordToHz(word: Long): Double =
         word.toDouble() * CONVERSION_CLOCK_HZ / 4294967296.0
 
+    /**
+     * High-priority command (port 1027, 1444 bytes): run/PTT, DDC and TX
+     * frequencies (Hz), drive, OC outputs, preamp, step attenuators and the
+     * Alex filter words. Resent on every control change.
+     *
+     * @param state The global state configuration.
+     * @return The 1444-byte high-priority command packet.
+     */
     fun highPriorityPacket(state: ControlState): ByteArray {
         val p = ByteArray(BUFLEN)
         var b4 = 0
@@ -326,6 +337,9 @@ object G2Protocol {
     /**
      * RX-specific command (port 1025, 1444 bytes): ADC config and per-DDC
      * enable/rate/size. DDC0/DDC1 both ride ADC0, 24-bit samples.
+     *
+     * @param state State containing receiver counts, rates, and dither settings.
+     * @return The 1444-byte RX-specific command packet.
      */
     fun rxSpecificPacket(state: ControlState): ByteArray {
         val p = ByteArray(BUFLEN)
@@ -362,6 +376,9 @@ object G2Protocol {
      * stream only two fields matter: one DAC and the fixed 192 kHz DUC rate.
      * CW/sidetone/mic bytes stay zero — voice reaches the radio pre-modulated
      * on port 1029, never through the radio's own mic path.
+     *
+     * @param state State containing attenuator and CW settings.
+     * @return The 60-byte TX-specific command packet.
      */
     fun txSpecificPacket(state: ControlState): ByteArray {
         val p = ByteArray(60)
@@ -468,8 +485,11 @@ object G2Protocol {
     /**
      * Parses a 1444-byte DDC IQ packet: 16-byte header (sequence, timestamp,
      * bits/sample, samples/packet) + 238 samples of 24-bit BE pairs, imaginary word first.
-     * Returns the packet sequence, or -1 if the packet is malformed.
-     * [onSample] receives I/Q in `[-1, 1]`.
+     *
+     * @param buf The raw packet byte array.
+     * @param length The total length of the packet.
+     * @param onSample Callback for every parsed complex IQ pair.
+     * @return The packet sequence, or -1 if the packet is malformed.
      */
     fun parseDdcIq(
         buf: ByteArray,
