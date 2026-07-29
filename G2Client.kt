@@ -23,6 +23,9 @@
  */
 
 package com.isaklab.libg2sdrk
+import com.isaklab.isdrdrivers.core.TxDriveCapable
+import com.isaklab.isdrdrivers.core.TransmitCapable
+import com.isaklab.isdrdrivers.core.RadioClient
 
 import android.util.Log
 import com.isaklab.isdrdrivers.core.DspThread
@@ -71,7 +74,7 @@ class G2Client(
      * with the matching `--port-offset` so the real 1024+ range stays free.
      */
     private val portOffset: Int = 0,
-) {
+) : RadioClient, TransmitCapable, TxDriveCapable {
     companion object {
         const val BROADCAST = "255.255.255.255"
         private const val TAG = "G2Client"
@@ -82,7 +85,7 @@ class G2Client(
     }
 
     /** When false, RX blocks skip the FFT and deliver an empty spectrum. */
-    @Volatile var spectrumEnabled: Boolean = true
+    @Volatile override var spectrumEnabled: Boolean = true
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     // Hot loops on threads of their own (see DspThread): a shared coroutine
@@ -158,7 +161,7 @@ class G2Client(
      *
      * @return true if successfully connected and initialized, false otherwise.
      */
-    suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
         try {
             onConnectionStatusChanged(false, "Discovering…")
             val s = DatagramSocket()
@@ -199,7 +202,7 @@ class G2Client(
      * Releases the UDP socket and safely terminates the RX, TX, and keepalive background
      * coroutines/threads. The radio is commanded to unkey and stop sending DDC streams.
      */
-    fun disconnect() {
+    override fun disconnect() {
         scope.launch {
             running = false
             try {
@@ -512,7 +515,7 @@ class G2Client(
      * Tunes the primary DDC (DDC0) to the specified frequency in Hz.
      * Enqueues a high-priority command and resets the FFT smoothing filter.
      */
-    fun setFrequency(hz: Long) {
+    override fun setFrequency(hz: Long) {
         synchronized(stateLock) { state.ddcFreqHz[0] = hz }
         sendHighPriority()
         spectrumWorker?.resetSmoothing()
@@ -532,7 +535,7 @@ class G2Client(
      * Sets the sampling rate for the active DDCs. Supported Protocol-2 rates are 
      * 48, 96, 192, 384, 768, and 1536 kHz. Invalid values fallback to 48 kHz.
      */
-    fun setSampleRate(hz: Int) {
+    override fun setSampleRate(hz: Int) {
         synchronized(stateLock) {
             state.sampleRate = if (hz in G2Protocol.SAMPLE_RATES) hz else 48_000
         }
@@ -599,12 +602,12 @@ class G2Client(
 
     fun setSmoothingFactor(alpha: Float) { fft?.setSmoothingFactor(alpha) }
 
-    fun setTxFrequency(hz: Long) {
+    override fun setTxFrequency(hz: Long) {
         synchronized(stateLock) { state.txFreqHz = hz }
         sendHighPriority()
     }
 
-    fun setPtt(on: Boolean) {
+    override fun setPtt(on: Boolean) {
         synchronized(stateLock) { state.mox = on }
         if (!on) {
             synchronized(txLock) { txQueue.clear() }
@@ -615,12 +618,12 @@ class G2Client(
         sendHighPriority()
     }
 
-    fun setTxDrive(level: Int) {
+    override fun setTxDrive(level: Int) {
         synchronized(stateLock) { state.txDrive = level.coerceIn(0, 255) }
         sendHighPriority()
     }
 
-    fun setPaEnabled(on: Boolean) {
+    override fun setPaEnabled(on: Boolean) {
         synchronized(stateLock) { state.paEnabled = on }
         sendGeneral()                      // PA enable lives in the General packet
     }
@@ -637,10 +640,10 @@ class G2Client(
         sendHighPriority()
     }
 
-    fun isTransmitting(): Boolean = synchronized(stateLock) { state.mox }
+    override fun isTransmitting(): Boolean = synchronized(stateLock) { state.mox }
 
     /** Queue interleaved transmit IQ (`i0,q0,…` in `[-1,1]`, 48 kSps). Drop-oldest. */
-    fun submitTxIq(iq: FloatArray) {
+    override fun submitTxIq(iq: FloatArray) {
         synchronized(txLock) { txQueue.write(iq) }   // ring drops oldest itself
     }
 
