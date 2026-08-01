@@ -93,6 +93,10 @@ class G2Client(
     // every paced beat.
     private var receiveThread: Thread? = null
     private var txSenderThread: Thread? = null
+    /** One-shot latch: the teardown of one connection runs exactly once,
+     *  whichever of the operator path, the timeout exit and the failure path
+     *  reaches it first. Cleared by [connect]. */
+    private val teardownDone = java.util.concurrent.atomic.AtomicBoolean(false)
     private var keepaliveJob: Job? = null
     private var socket: DatagramSocket? = null
     private var radio: InetAddress? = null
@@ -164,6 +168,10 @@ class G2Client(
     override suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
         try {
             onConnectionStatusChanged(false, "Discovering…")
+            // Arm the teardown latch before anything is allocated: the catch
+            // below unwinds through teardown, and it must not be no-opped by
+            // the latch the PREVIOUS session left set.
+            teardownDone.set(false)
             val s = DatagramSocket()
             s.soTimeout = 1000
             s.broadcast = true
@@ -203,23 +211,58 @@ class G2Client(
      * coroutines/threads. The radio is commanded to unkey and stop sending DDC streams.
      */
     override fun disconnect() {
-        scope.launch {
-            running = false
-            try {
-                synchronized(stateLock) { state.run = false; state.mox = false }
-                sendHighPriority()
-            } catch (_: Exception) {}
-            keepaliveJob?.cancel()
-            // The socket is what unblocks the receive loop; close it first.
-            socket?.close()
-            DspThread.stop(receiveThread)
-            DspThread.stop(txSenderThread)
-            receiveThread = null
-            txSenderThread = null
-            spectrumWorker?.stop()
-            socket = null
-            onConnectionStatusChanged(false, "Disconnected")
-        }
+        scope.launch { teardown("Disconnected") }
+    }
+
+    /**
+     * Unkeys the radio, stops the streams and releases the socket and the loop
+     * threads, exactly once per connection.
+     *
+     * Shared by [disconnect], the receive loop's timeout/error exits and
+     * [failLink], so every way out of a session ends with the radio told to
+     * stop and the host told the link is gone. The unkey is first and on the
+     * wire: [state].mox only lives in memory until the TX pacer sends it, and
+     * on an abrupt exit the pacer may never get another turn — which would
+     * leave the radio holding the MOX of its last received packet.
+     *
+     * Never joins a loop thread from that same thread (the failure and
+     * timeout exits run on one of them).
+     */
+    private fun teardown(statusMessage: String) {
+        if (!teardownDone.compareAndSet(false, true)) return
+        running = false
+        val self = Thread.currentThread()
+        try {
+            synchronized(stateLock) { state.run = false; state.mox = false }
+            sendHighPriority()
+        } catch (_: Exception) {}
+        keepaliveJob?.cancel()
+        // The socket is what unblocks the receive loop; close it first.
+        socket?.close()
+        receiveThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
+        txSenderThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
+        receiveThread = null
+        txSenderThread = null
+        spectrumWorker?.stop()
+        socket = null
+        onConnectionStatusChanged(false, statusMessage)
+    }
+
+    /**
+     * Retire the connection after one of the loop threads died on an
+     * unhandled throwable. DspThread has already logged it at ERROR with the
+     * stack; this makes the death VISIBLE instead of leaving a dead loop
+     * behind a live-looking connection.
+     *
+     * The transmit pacer is the dangerous one: it is the only sender of TX IQ,
+     * so if it dies while keyed the host still shows "on air", the operator
+     * keeps talking, and no RF is produced — [teardown] unkeys on the wire and
+     * reports the failure. A throwable raised while a teardown is already
+     * running is that teardown closing the socket under a send, and the latch
+     * makes this a no-op.
+     */
+    private fun failLink() {
+        teardown(if (running) "Error" else "Disconnected")
     }
 
     private fun discover(s: DatagramSocket): InetAddress? {
@@ -255,7 +298,7 @@ class G2Client(
 
     private fun startReceiving() {
         // Audio priority: block delivery must not lose CPU to rendering.
-        receiveThread = DspThread.start("g2-rx", DspThread.PRIORITY_RADIO) {
+        receiveThread = DspThread.start("g2-rx", DspThread.PRIORITY_RADIO, onFailure = { failLink() }) {
             spectrumWorker?.start()
             val buf = ByteArray(2048)
             val packet = DatagramPacket(buf, buf.size)
@@ -307,15 +350,17 @@ class G2Client(
                         // radio power-cycle both recover from this.
                         try { sendStartSequence() } catch (_: Exception) {}
                         if (noData > 15) {
-                            onConnectionStatusChanged(false, "Timeout")
-                            running = false
+                            // Full teardown, not just running=false: the radio
+                            // has to be told to stop streaming and the socket
+                            // and worker threads have to go, or they survive
+                            // until the next connect.
+                            teardown("Timeout")
                         }
                     }
                 } catch (e: Exception) {
                     if (running) {
                         Log.e(TAG, "rx error: ${e.message}")
-                        onConnectionStatusChanged(false, "Error")
-                        running = false
+                        teardown("Error")
                     }
                 }
             }
@@ -412,11 +457,12 @@ class G2Client(
     /**
      * Streams TX IQ at exactly 800 packets/s while keyed (192 kSps / 240
      * samples). Wall-clock paced with a burst cap; on mic underrun the clock
-     * is rebased instead of blasting a stale catch-up burst (the reference
-     * client simply stalls, which starves the DUC the same way).
+     * is rebased instead of blasting a stale catch-up burst, which would put
+     * a block of already-stale audio on the air and then starve the DUC again
+     * on the next beat.
      */
     private fun startTxSender() {
-        txSenderThread = DspThread.start("g2-tx", DspThread.PRIORITY_RADIO) {
+        txSenderThread = DspThread.start("g2-tx", DspThread.PRIORITY_RADIO, onFailure = { failLink() }) {
             var txStartNs = 0L
             var packetsSent = 0L
             while (running) {
