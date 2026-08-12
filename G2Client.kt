@@ -87,6 +87,15 @@ class G2Client(
     /** When false, RX blocks skip the FFT and deliver an empty spectrum. */
     @Volatile override var spectrumEnabled: Boolean = true
 
+    /**
+     * Narrow the panadapter's span before the transform; returns the
+     * decimation actually in force. With no session there is nothing to hold
+     * it, and the answer is an honest 1 rather than the request echoed back.
+     */
+    fun setSpectrumZoom(decimation: Int, offsetHz: Long): Int =
+        spectrumWorker?.setZoom(decimation, offsetHz.toDouble(), getSampleRate()) ?: 1
+
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     // Hot loops on threads of their own (see DspThread): a shared coroutine
     // pool leaked their audio priority and hopped them between workers on
