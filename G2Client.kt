@@ -655,6 +655,10 @@ class G2Client(
 
     fun getSampleRate(): Double = synchronized(stateLock) { state.sampleRate.toDouble() }
 
+    override fun frequencyHz(): Long = synchronized(stateLock) { state.ddcFreqHz[0] }
+
+    override fun sampleRateHz(): Int = synchronized(stateLock) { state.sampleRate }
+
     fun setSmoothingFactor(alpha: Float) { fft?.setSmoothingFactor(alpha) }
 
     override fun setTxFrequency(hz: Long) {
