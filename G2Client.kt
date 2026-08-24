@@ -109,6 +109,8 @@ class G2Client(
     private var keepaliveJob: Job? = null
     private var socket: DatagramSocket? = null
     private var radio: InetAddress? = null
+    /** Last concrete discovery refusal, surfaced to the operator on failure. */
+    private var discoveryFailure: String? = null
     @Volatile private var running = false
 
     private var fft: FFTProcessor? = null
@@ -151,7 +153,13 @@ class G2Client(
     // not a time-warp; a late reordered packet is dropped (its samples would
     // land out of order in the accumulator).
     private val ddcSeqAll = Array(MAX_RECEIVERS) { SeqTracker() }
-    private val ddcSeq get() = ddcSeqAll[activeReceiver.coerceIn(0, MAX_RECEIVERS - 1)]
+    private val ddcSeq: SeqTracker
+        get() {
+            check(activeReceiver in 0 until MAX_RECEIVERS) {
+                "active receiver $activeReceiver is outside 0 until $MAX_RECEIVERS"
+            }
+            return ddcSeqAll[activeReceiver]
+        }
 
     /** RX discontinuity events (loss/reorder) since connect — telemetry. */
     val rxGapCount: Long get() = ddcSeqAll.sumOf { it.gapEvents }
@@ -189,9 +197,19 @@ class G2Client(
             // scheduler stall. Ask for 2 MiB (kernel may clamp).
             try { s.receiveBufferSize = 2 * 1024 * 1024 } catch (_: Exception) {}
             socket = s
-            radio = if (host == BROADCAST) discover(s) else InetAddress.getByName(host)
+            discoveryFailure = null
+            val directed = host != BROADCAST
+            val discoveryTarget = InetAddress.getByName(if (directed) host else BROADCAST)
+            radio = discover(s, discoveryTarget, directed)
             if (radio == null) {
-                onConnectionStatusChanged(false, "No Protocol-2 radio found")
+                onConnectionStatusChanged(
+                    false,
+                    discoveryFailure ?: if (directed) {
+                        "No compatible ANAN-G2 found at $host"
+                    } else {
+                        "No compatible ANAN-G2 found"
+                    },
+                )
                 socket = null
                 s.close()
                 return@withContext false
@@ -220,6 +238,9 @@ class G2Client(
      * coroutines/threads. The radio is commanded to unkey and stop sending DDC streams.
      */
     override fun disconnect() {
+        // Refuse new terminal controls immediately; resource teardown remains
+        // asynchronous so callers are never blocked on loop shutdown.
+        running = false
         scope.launch { teardown("Disconnected") }
     }
 
@@ -274,17 +295,45 @@ class G2Client(
         teardown(if (running) "Error" else "Disconnected")
     }
 
-    private fun discover(s: DatagramSocket): InetAddress? {
+    /**
+     * Discover and positively identify a Saturn/G2 product even for an
+     * explicitly entered IP.  A resolved IP is not evidence of a radio, and
+     * a generic HPSDR reply is not evidence of Protocol-2 support.
+     */
+    private fun discover(
+        s: DatagramSocket,
+        target: InetAddress,
+        directed: Boolean,
+    ): InetAddress? {
         val req = G2Protocol.discoveryRequest()
-        val reply = ByteArray(256)
         repeat(4) {
             try {
-                s.send(DatagramPacket(req, req.size, InetAddress.getByName(BROADCAST), G2Protocol.GENERAL_PORT + portOffset))
+                s.send(DatagramPacket(req, req.size, target, G2Protocol.GENERAL_PORT + portOffset))
+                val reply = ByteArray(256)
                 val p = DatagramPacket(reply, reply.size)
                 s.receive(p)
+                if (directed && p.address != target) {
+                    Log.w(TAG, "ignored discovery reply from ${p.address.hostAddress}; expected ${target.hostAddress}")
+                    return@repeat
+                }
                 val info = G2Protocol.parseDiscoveryReply(reply, p.length)
-                if (info != null && !info.busy) {
-                    Log.i(TAG, "found ${G2Protocol.Board.name(info.boardId)} at " +
+                if (info == null) return@repeat
+                if (info.busy) {
+                    discoveryFailure = "${G2Protocol.DiscoveryBoardId.name(info.boardId)} at " +
+                        "${p.address.hostAddress} is busy"
+                    if (directed) return null
+                    return@repeat
+                }
+                if (!G2Protocol.DiscoveryBoardId.isG2Product(info.boardId)) {
+                    discoveryFailure = "Unsupported Protocol-2 product reply: " +
+                        "${G2Protocol.DiscoveryBoardId.name(info.boardId)} (board ${info.boardId}); " +
+                        "select its exact HPSDR profile"
+                    Log.e(TAG, discoveryFailure!!)
+                    if (directed) return null
+                    return@repeat
+                }
+                if (!info.busy) {
+                    Log.i(TAG, "found ${G2Protocol.DiscoveryBoardId.name(info.boardId)} at " +
                         "${p.address.hostAddress} mac=${info.mac} ddcs=${info.ddcCount}")
                     return p.address
                 }
@@ -526,8 +575,9 @@ class G2Client(
     // ========================================================================
 
     private fun sendTo(port: Int, payload: ByteArray) {
-        val s = socket ?: return
-        val dst = radio ?: return
+        val s = socket ?: throw IllegalStateException("G2 control socket is not running")
+        if (s.isClosed) throw IllegalStateException("G2 control socket is closed")
+        val dst = radio ?: throw IllegalStateException("G2 radio identity is unavailable")
         s.send(DatagramPacket(payload, payload.size, dst, port + portOffset))
     }
 
@@ -543,6 +593,19 @@ class G2Client(
     private fun sendHighPriority() =
         sendTo(G2Protocol.HIGH_PRIORITY_PORT, synchronized(stateLock) { G2Protocol.highPriorityPacket(state) })
 
+    /** A terminal control may not turn a missing UDP session into success. */
+    private fun requireControlTransport() {
+        if (!running) throw IllegalStateException("G2 control transport is not running")
+        val s = socket ?: throw IllegalStateException("G2 control socket is not running")
+        if (s.isClosed) throw IllegalStateException("G2 control socket is closed")
+        if (radio == null) throw IllegalStateException("G2 radio identity is unavailable")
+    }
+
+    private fun sendRequired(port: Int, payload: ByteArray) {
+        requireControlTransport()
+        sendTo(port, payload)
+    }
+
     /**
      * State refresh loop: the high-priority packet every second (UDP loss
      * insurance) and, when the watchdog is armed, the General packet every
@@ -557,7 +620,13 @@ class G2Client(
                 try {
                     if (synchronized(stateLock) { state.watchdogEnabled }) sendGeneral()
                     if (tick % 2 == 0) sendHighPriority()
-                } catch (_: Exception) {}
+                } catch (failure: Exception) {
+                    if (running) {
+                        Log.e(TAG, "G2 keepalive failed", failure)
+                        failLink()
+                    }
+                    return@launch
+                }
             }
         }
     }
@@ -568,33 +637,63 @@ class G2Client(
 
     /**
      * Tunes the primary DDC (DDC0) to the specified frequency in Hz.
-     * Enqueues a high-priority command and resets the FFT smoothing filter.
+     * Writes a required high-priority command before returning and resets the
+     * FFT smoothing filter only after that terminal write succeeds.
      */
     override fun setFrequency(hz: Long) {
-        synchronized(stateLock) { state.ddcFreqHz[0] = hz }
-        sendHighPriority()
-        spectrumWorker?.resetSmoothing()
+        setRxFrequency(0, hz)
     }
 
     fun setFrequency2(hz: Long) = setRxFrequency(1, hz)
 
     /** Set any DDC's NCO frequency (0..6) — high-priority phase word 9+4n. */
     fun setRxFrequency(index: Int, hz: Long) {
-        if (index !in 0 until MAX_RECEIVERS) return
-        synchronized(stateLock) { state.ddcFreqHz[index] = hz }
-        sendHighPriority()
+        val count = synchronized(stateLock) { state.receiverCount }
+        require(index in 0 until count) {
+            "receiver $index is outside configured count $count"
+        }
+        require(hz in 10_000L..61_400_000L) {
+            "G2 RX frequency $hz Hz is outside 10000..61400000 Hz"
+        }
+        requireControlTransport()
+        val previous = synchronized(stateLock) {
+            state.ddcFreqHz.copyOf().also {
+                if (state.ddcSync01 && index < 2) {
+                    state.ddcFreqHz[0] = hz
+                    state.ddcFreqHz[1] = hz
+                } else {
+                    state.ddcFreqHz[index] = hz
+                }
+            }
+        }
+        try {
+            val packet = synchronized(stateLock) { G2Protocol.highPriorityPacket(state) }
+            sendRequired(G2Protocol.HIGH_PRIORITY_PORT, packet)
+        } catch (failure: Exception) {
+            synchronized(stateLock) { previous.copyInto(state.ddcFreqHz) }
+            failLink()
+            throw failure
+        }
         if (index == activeReceiver) spectrumWorker?.resetSmoothing()
     }
 
-    /**
-     * Sets the sampling rate for the active DDCs. Supported Protocol-2 rates are 
-     * 48, 96, 192, 384, 768, and 1536 kHz. Invalid values fallback to 48 kHz.
-     */
+    /** Sets one exact Protocol-2 DDC sample rate. */
     override fun setSampleRate(hz: Int) {
-        synchronized(stateLock) {
-            state.sampleRate = if (hz in G2Protocol.SAMPLE_RATES) hz else 48_000
+        require(hz in G2Protocol.SAMPLE_RATES) {
+            "sample rate $hz is not one of ${G2Protocol.SAMPLE_RATES.sorted()}"
         }
-        sendRxSpecific()
+        requireControlTransport()
+        val previous = synchronized(stateLock) {
+            state.sampleRate.also { state.sampleRate = hz }
+        }
+        try {
+            val packet = synchronized(stateLock) { G2Protocol.rxSpecificPacket(state) }
+            sendRequired(G2Protocol.RX_SPECIFIC_PORT, packet)
+        } catch (failure: Exception) {
+            synchronized(stateLock) { state.sampleRate = previous }
+            failLink()
+            throw failure
+        }
         updateFlushThreshold()
         spectrumWorker?.resetSmoothing()
     }
@@ -604,24 +703,74 @@ class G2Client(
      * The hardware automatically multiplexes the streams to ports 1035+.
      */
     fun setReceiverCount(n: Int) {
-        synchronized(stateLock) { state.receiverCount = n.coerceIn(1, MAX_RECEIVERS) }
-        sendRxSpecific()
-        sendHighPriority()                 // push the new DDCs' NCO words too
+        require(n in 1..MAX_RECEIVERS) { "receiver count $n is outside 1..$MAX_RECEIVERS" }
+        require(activeReceiver < n) { "active receiver $activeReceiver is outside count $n" }
+        require(rxStreamMask and ((1 shl n) - 1).inv() == 0) {
+            "receiver stream mask references a removed receiver"
+        }
+        require(!synchronized(stateLock) { state.ddcSync01 } || n >= 2) {
+            "DDC0/DDC1 diversity cannot survive receiver count $n"
+        }
+        requireControlTransport()
+        val previous = synchronized(stateLock) {
+            state.receiverCount.also { state.receiverCount = n }
+        }
+        try {
+            val rxPacket = synchronized(stateLock) { G2Protocol.rxSpecificPacket(state) }
+            val frequencyPacket = synchronized(stateLock) { G2Protocol.highPriorityPacket(state) }
+            sendRequired(G2Protocol.RX_SPECIFIC_PORT, rxPacket)
+            sendRequired(G2Protocol.HIGH_PRIORITY_PORT, frequencyPacket)
+        } catch (failure: Exception) {
+            synchronized(stateLock) { state.receiverCount = previous }
+            failLink()
+            throw failure
+        }
     }
 
     fun setActiveReceiver(index: Int) {
-        activeReceiver = index.coerceIn(0, MAX_RECEIVERS - 1)
+        val count = synchronized(stateLock) { state.receiverCount }
+        require(index in 0 until count) { "receiver $index is outside configured count $count" }
+        require(rxStreamMask and (1 shl index) == 0) {
+            "active receiver $index is already an additional stream"
+        }
+        require(!synchronized(stateLock) { state.ddcSync01 } || index == 0) {
+            "G2 DDC0/DDC1 diversity requires receiver 0 as reference"
+        }
+        requireControlTransport()
+        val previousActive = activeReceiver
+        val pureSignal = synchronized(stateLock) { state.pureSignal }
+        activeReceiver = index
+        try {
+            if (pureSignal) updatePsRouting()
+        } catch (failure: Exception) {
+            activeReceiver = previousActive
+            synchronized(stateLock) {
+                state.psFeedbackDdc = if (state.pureSignal) {
+                    if (previousActive == 1) 0 else 1
+                } else {
+                    -1
+                }
+            }
+            failLink()
+            throw failure
+        }
         ddcSeq.reset()                     // new stream, new sequence space
         spectrumWorker?.resetSmoothing()
-        // PureSignal's feedback DDC is derived from the active receiver —
-        // keep the DDC input routing in step.
-        if (synchronized(stateLock) { state.pureSignal }) updatePsRouting()
     }
 
     /** Bit n = also stream DDC n's IQ via the onDataRx callback. */
     fun setRxStreamMask(mask: Int) {
+        val count = synchronized(stateLock) { state.receiverCount }
+        val allowed = (1 shl count) - 1
+        require(mask >= 0 && mask and allowed.inv() == 0) {
+            "receiver stream mask 0x${mask.toString(16)} exceeds 0x${allowed.toString(16)}"
+        }
+        require(mask and (1 shl activeReceiver) == 0) {
+            "receiver stream mask contains active/reference receiver $activeReceiver"
+        }
+        requireControlTransport()
         val old = rxStreamMask
-        rxStreamMask = mask and ((1 shl MAX_RECEIVERS) - 1)
+        rxStreamMask = mask
         if (rxStreamMask == 0) accumRxPairs.fill(0)
         // Newly armed streams start a fresh sequence space.
         for (rx in 0 until MAX_RECEIVERS) {
@@ -633,14 +782,111 @@ class G2Client(
     }
 
     /**
+     * Explicit G2 diversity transaction. Stream delivery is a separate
+     * command: this method only establishes the physical ADC/NCO/sync meaning.
+     */
+    fun setDiversity(enabled: Boolean, referenceReceiver: Int, memberMask: Int) {
+        if (enabled) {
+            require(referenceReceiver == 0 && memberMask == 0b10) {
+                "G2 hardware sync currently supports only reference=0/memberMask=0b10"
+            }
+            require(activeReceiver == 0) { "G2 diversity requires receiver 0 as reference" }
+            require(synchronized(stateLock) { state.receiverCount >= 2 }) {
+                "G2 diversity needs two configured receivers"
+            }
+            require(!synchronized(stateLock) { state.pureSignal && state.psFeedbackDdc == 1 }) {
+                "DDC1 is already claimed by PureSignal feedback"
+            }
+        } else {
+            require(memberMask == 0) { "disabled diversity must use memberMask=0" }
+            require(referenceReceiver == activeReceiver) {
+                "disabled diversity reference $referenceReceiver is not active $activeReceiver"
+            }
+        }
+
+        val previous = synchronized(stateLock) {
+            Triple(state.diversityRoute01, state.ddcSync01, state.ddcFreqHz[1])
+        }
+        if (previous.second == enabled) return
+        try {
+            if (enabled) {
+                // 1. Put DDC1 on ADC2 while sync is still clear.
+                val routePacket = synchronized(stateLock) {
+                    state.diversityRoute01 = true
+                    state.ddcSync01 = false
+                    G2Protocol.rxSpecificPacket(state)
+                }
+                sendRequired(G2Protocol.RX_SPECIFIC_PORT, routePacket)
+
+                // 2. Lock both NCOs and publish that phase word.
+                val frequencyPacket = synchronized(stateLock) {
+                    state.ddcFreqHz[1] = state.ddcFreqHz[0]
+                    G2Protocol.highPriorityPacket(state)
+                }
+                sendRequired(G2Protocol.HIGH_PRIORITY_PORT, frequencyPacket)
+
+                // 3. Only now advertise the coherent pair.
+                val syncPacket = synchronized(stateLock) {
+                    state.ddcSync01 = true
+                    G2Protocol.rxSpecificPacket(state)
+                }
+                sendRequired(G2Protocol.RX_SPECIFIC_PORT, syncPacket)
+            } else {
+                // Clear synchronisation before allowing the ADC route to
+                // collapse back onto the ordinary single-ADC layout.
+                val clearPacket = synchronized(stateLock) {
+                    state.ddcSync01 = false
+                    G2Protocol.rxSpecificPacket(state)
+                }
+                sendRequired(G2Protocol.RX_SPECIFIC_PORT, clearPacket)
+                val neutralPacket = synchronized(stateLock) {
+                    state.diversityRoute01 = false
+                    G2Protocol.rxSpecificPacket(state)
+                }
+                sendRequired(G2Protocol.RX_SPECIFIC_PORT, neutralPacket)
+            }
+        } catch (failure: Exception) {
+            synchronized(stateLock) {
+                state.diversityRoute01 = previous.first
+                state.ddcSync01 = previous.second
+                state.ddcFreqHz[1] = previous.third
+            }
+            // One or more UDP datagrams may already have reached the FPGA.
+            // Memory rollback is not enough: retire the indeterminate session
+            // so DriverSession cannot confirm a state that hardware may not hold.
+            failLink()
+            throw failure
+        }
+    }
+
+    /**
      * PureSignal TX-feedback routing: while on, the reference DDC (the pair
      * partner of the active receiver, same derivation as the app/HL2 —
      * active==1 ⇒ DDC0, else DDC1) is fed from the TX/DUC loopback instead of
      * the ADC, so the app can collect (feedback, reference) pairs while keyed.
      */
     fun setPureSignal(on: Boolean) {
-        synchronized(stateLock) { state.pureSignal = on }
-        updatePsRouting()
+        require(!on || !synchronized(stateLock) { state.ddcSync01 }) {
+            "DDC1 cannot be PureSignal feedback while RX1/RX2 diversity is active"
+        }
+        requireControlTransport()
+        val previous = synchronized(stateLock) {
+            Pair(state.pureSignal, state.psFeedbackDdc).also {
+                state.pureSignal = on
+                state.psFeedbackDdc = if (on) (if (activeReceiver == 1) 0 else 1) else -1
+            }
+        }
+        try {
+            val packet = synchronized(stateLock) { G2Protocol.rxSpecificPacket(state) }
+            sendRequired(G2Protocol.RX_SPECIFIC_PORT, packet)
+        } catch (failure: Exception) {
+            synchronized(stateLock) {
+                state.pureSignal = previous.first
+                state.psFeedbackDdc = previous.second
+            }
+            failLink()
+            throw failure
+        }
     }
 
     private fun updatePsRouting() {
@@ -648,7 +894,8 @@ class G2Client(
             state.psFeedbackDdc =
                 if (state.pureSignal) (if (activeReceiver == 1) 0 else 1) else -1
         }
-        sendRxSpecific()
+        val packet = synchronized(stateLock) { G2Protocol.rxSpecificPacket(state) }
+        sendRequired(G2Protocol.RX_SPECIFIC_PORT, packet)
     }
 
     fun getActiveReceiver(): Int = activeReceiver
@@ -661,42 +908,111 @@ class G2Client(
 
     fun setSmoothingFactor(alpha: Float) { fft?.setSmoothingFactor(alpha) }
 
-    override fun setTxFrequency(hz: Long) {
-        synchronized(stateLock) { state.txFreqHz = hz }
-        sendHighPriority()
+    override fun setTxFrequency(hz: Long): Boolean {
+        require(hz in 10_000L..61_400_000L) {
+            "G2 TX frequency $hz Hz is outside 10000..61400000 Hz"
+        }
+        requireControlTransport()
+        val previous = synchronized(stateLock) {
+            state.txFreqHz.also { state.txFreqHz = hz }
+        }
+        try {
+            val packet = synchronized(stateLock) { G2Protocol.highPriorityPacket(state) }
+            sendRequired(G2Protocol.HIGH_PRIORITY_PORT, packet)
+        } catch (failure: Exception) {
+            synchronized(stateLock) { state.txFreqHz = previous }
+            failLink()
+            throw failure
+        }
+        return true
     }
 
     override fun setPtt(on: Boolean) {
-        synchronized(stateLock) { state.mox = on }
+        requireControlTransport()
+        val previous = synchronized(stateLock) {
+            state.mox.also { state.mox = on }
+        }
+        try {
+            val packet = synchronized(stateLock) { G2Protocol.highPriorityPacket(state) }
+            sendRequired(G2Protocol.HIGH_PRIORITY_PORT, packet)
+        } catch (failure: Exception) {
+            synchronized(stateLock) { state.mox = previous }
+            failLink()
+            throw failure
+        }
         if (!on) {
             synchronized(txLock) { txQueue.clear() }
             // Unkey: the spectrum jumps from TX leakage back to band noise —
             // restart the smoothing IIR instead of cross-fading the ghost.
             spectrumWorker?.resetSmoothing()
         }
-        sendHighPriority()
     }
 
     override fun setTxDrive(level: Int) {
-        synchronized(stateLock) { state.txDrive = level.coerceIn(0, 255) }
-        sendHighPriority()
+        require(level in 0..255) { "TX drive $level is outside 0..255" }
+        requireControlTransport()
+        val previous = synchronized(stateLock) {
+            state.txDrive.also { state.txDrive = level }
+        }
+        try {
+            val packet = synchronized(stateLock) { G2Protocol.highPriorityPacket(state) }
+            sendRequired(G2Protocol.HIGH_PRIORITY_PORT, packet)
+        } catch (failure: Exception) {
+            synchronized(stateLock) { state.txDrive = previous }
+            failLink()
+            throw failure
+        }
     }
 
     override fun setPaEnabled(on: Boolean) {
-        synchronized(stateLock) { state.paEnabled = on }
-        sendGeneral()                      // PA enable lives in the General packet
+        requireControlTransport()
+        val previous = synchronized(stateLock) {
+            state.paEnabled.also { state.paEnabled = on }
+        }
+        try {
+            val packet = synchronized(stateLock) { G2Protocol.generalPacket(state) }
+            sendRequired(G2Protocol.GENERAL_PORT, packet)
+        } catch (failure: Exception) {
+            synchronized(stateLock) { state.paEnabled = previous }
+            failLink()
+            throw failure
+        }
     }
 
     /** RX step attenuator, 0–31 dB (both ADCs mirrored). */
     fun setStepAttenuator(db: Int) {
-        synchronized(stateLock) { state.stepAttenDb = db.coerceIn(0, 31) }
-        sendHighPriority()
+        require(db in 0..31) { "step attenuator $db dB is outside 0..31" }
+        requireControlTransport()
+        val previous = synchronized(stateLock) {
+            state.stepAttenDb.also { state.stepAttenDb = db }
+        }
+        try {
+            val packet = synchronized(stateLock) { G2Protocol.highPriorityPacket(state) }
+            sendRequired(G2Protocol.HIGH_PRIORITY_PORT, packet)
+        } catch (failure: Exception) {
+            synchronized(stateLock) { state.stepAttenDb = previous }
+            failLink()
+            throw failure
+        }
     }
 
     /** The 7 open-collector outputs (external band data / linear switching). */
     fun setOpenCollectorOutputs(mask: Int) {
-        synchronized(stateLock) { state.ocOutputs = mask and 0x7F }
-        sendHighPriority()
+        require(mask >= 0 && mask and 0x7F.inv() == 0) {
+            "open-collector mask 0x${mask.toString(16)} exceeds 0x7f"
+        }
+        requireControlTransport()
+        val previous = synchronized(stateLock) {
+            state.ocOutputs.also { state.ocOutputs = mask }
+        }
+        try {
+            val packet = synchronized(stateLock) { G2Protocol.highPriorityPacket(state) }
+            sendRequired(G2Protocol.HIGH_PRIORITY_PORT, packet)
+        } catch (failure: Exception) {
+            synchronized(stateLock) { state.ocOutputs = previous }
+            failLink()
+            throw failure
+        }
     }
 
     override fun isTransmitting(): Boolean = synchronized(stateLock) { state.mox }

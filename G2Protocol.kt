@@ -61,8 +61,13 @@ object G2Protocol {
     /** DDC sample rates the protocol accepts (kHz value goes on the wire). */
     val SAMPLE_RATES = listOf(48_000, 96_000, 192_000, 384_000, 768_000, 1_536_000)
 
-    /** Device-type ids from the discovery reply (Thetis enums.cs HPSDRHW). */
-    object Board {
+    /**
+     * Numeric identities from the shared HPSDR discovery namespace
+     * (Thetis enums.cs HPSDRHW). These are discovery bytes, never app
+     * DeviceType/product selections; names such as HERMES only explain a
+     * reply that [G2Client] must reject as non-Protocol-2.
+     */
+    object DiscoveryBoardId {
         const val ATLAS = 0
         const val HERMES = 1
         const val HERMES2 = 2
@@ -81,6 +86,20 @@ object G2Protocol {
             SATURN_MK2 -> "Saturn MkII (ANAN-G2)"; G2E -> "ANAN-G2E"
             else -> "unknown ($id)"
         }
+
+        /**
+         * True only for products whose firmware implements the Saturn/G2
+         * Protocol-2 control and stream contract used by [G2Client].
+         *
+         * Hermes, Hermes II and Hermes-Lite IDs occur in the wider HPSDR
+         * discovery namespace, but that does not make those radios G2s.  In
+         * particular, accepting every syntactically valid discovery reply
+         * here would open a Protocol-1 product with Protocol-2 commands.
+         * ORION2 is retained because Saturn firmware reports ID 5 on the
+         * documented compatibility path.
+         */
+        fun isG2Product(id: Int): Boolean = id == ORION2 || id == SATURN ||
+            id == SATURN_MK2 || id == G2E
     }
 
     /** Programmable radio state serialized into the command packets. */
@@ -112,6 +131,9 @@ object G2Protocol {
         var adcDither = 0
         var adcRandom = 0
         // Synchronised (interleaved) DDC pair 0+1 — coherent diversity.
+        // Route and sync are separate so the client can put DDC1 on ADC2,
+        // frequency-lock the NCOs, and only then announce synchronisation.
+        var diversityRoute01 = false
         var ddcSync01 = false
         // Hardware CW keyer (DUC bytes 5..17).
         var cwEnabled = false
@@ -314,10 +336,13 @@ object G2Protocol {
     /** RX antenna select word (new-client path, offset 1432). */
     fun rxAntennaWord(state: ControlState): Int = antennaBit(state.rxAntenna)
 
-    private fun antennaBit(n: Int): Int = when (n.coerceIn(1, 3)) {
-        1 -> Alex.TX_ANT_1
-        2 -> Alex.TX_ANT_2
-        else -> Alex.TX_ANT_3
+    private fun antennaBit(n: Int): Int {
+        require(n in 1..3) { "antenna $n is outside 1..3" }
+        return when (n) {
+            1 -> Alex.TX_ANT_1
+            2 -> Alex.TX_ANT_2
+            else -> Alex.TX_ANT_3
+        }
     }
 
     /** RX band-pass word for a frequency (Saturn BPF bank edges). */
@@ -336,18 +361,39 @@ object G2Protocol {
 
     /**
      * RX-specific command (port 1025, 1444 bytes): ADC config and per-DDC
-     * enable/rate/size. DDC0/DDC1 both ride ADC0, 24-bit samples.
+     * enable/rate/size. Ordinary DDCs ride ADC1; the explicit diversity
+     * transaction routes DDC1 to ADC2 before asserting the sync field.
      *
      * @param state State containing receiver counts, rates, and dither settings.
      * @return The 1444-byte RX-specific command packet.
      */
     fun rxSpecificPacket(state: ControlState): ByteArray {
+        require(state.receiverCount in 1..MAX_DDC) {
+            "receiver count ${state.receiverCount} is outside 1..$MAX_DDC"
+        }
+        require(state.sampleRate in SAMPLE_RATES) {
+            "sample rate ${state.sampleRate} is not an exact Protocol-2 rate"
+        }
+        require(state.adcDither in 0..0b11) { "ADC dither mask exceeds 0b11" }
+        require(state.adcRandom in 0..0b11) { "ADC random mask exceeds 0b11" }
+        if (state.diversityRoute01) {
+            require(state.receiverCount >= 2) { "RX1/RX2 route requires two DDCs" }
+        }
+        if (state.ddcSync01) {
+            require(state.diversityRoute01) { "RX1/RX2 sync requires the typed ADC route" }
+            require(state.ddcFreqHz[0] == state.ddcFreqHz[1]) {
+                "RX1/RX2 sync requires frequency-locked NCOs"
+            }
+            require(!state.pureSignal || state.psFeedbackDdc != 1) {
+                "RX2 cannot be diversity input and PureSignal feedback"
+            }
+        }
         val p = ByteArray(BUFLEN)
         p[4] = 2                                      // ADCs on a Saturn
-        p[5] = (state.adcDither and 0x03).toByte()    // dither: bit0 ADC1, bit1 ADC2
-        p[6] = (state.adcRandom and 0x03).toByte()    // random: bit0 ADC1, bit1 ADC2
+        p[5] = state.adcDither.toByte()               // dither: bit0 ADC1, bit1 ADC2
+        p[6] = state.adcRandom.toByte()               // random: bit0 ADC1, bit1 ADC2
         // DDC enable bits (LE16, low byte first): bit n = DDC n armed.
-        val nRx = state.receiverCount.coerceIn(1, MAX_DDC)
+        val nRx = state.receiverCount
         val enable = (1 shl nRx) - 1
         p[7] = (enable and 0xFF).toByte()
         p[8] = ((enable ushr 8) and 0xFF).toByte()
@@ -356,10 +402,10 @@ object G2Protocol {
         // With PureSignal on, the feedback DDC's input is the TX/DUC loopback.
         for (n in 0 until MAX_DDC) {
             val b = 17 + 6 * n
-            p[b] = if (state.pureSignal && n == state.psFeedbackDdc) {
-                DDC_INPUT_TX_FEEDBACK.toByte()
-            } else {
-                DDC_INPUT_ADC0.toByte()
+            p[b] = when {
+                state.pureSignal && n == state.psFeedbackDdc -> DDC_INPUT_TX_FEEDBACK.toByte()
+                state.diversityRoute01 && n == 1 -> DDC_INPUT_ADC1.toByte()
+                else -> DDC_INPUT_ADC0.toByte()
             }
             putBE16(p, b + 1, rateKhz)
             p[b + 5] = 24
