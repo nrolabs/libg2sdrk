@@ -106,6 +106,8 @@ class G2Client(
      *  whichever of the operator path, the timeout exit and the failure path
      *  reaches it first. Cleared by [connect]. */
     private val teardownDone = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val teardownLock = Object()
+    @Volatile private var teardownOwner: Thread? = null
     private var keepaliveJob: Job? = null
     private var socket: DatagramSocket? = null
     private var radio: InetAddress? = null
@@ -238,10 +240,11 @@ class G2Client(
      * coroutines/threads. The radio is commanded to unkey and stop sending DDC streams.
      */
     override fun disconnect() {
-        // Refuse new terminal controls immediately; resource teardown remains
-        // asynchronous so callers are never blocked on loop shutdown.
+        // Refuse controls immediately and honour RadioClient's terminal
+        // teardown contract before the physical endpoint can be reused.
+        // teardown() skips self-join when invoked by one of its loop threads.
         running = false
-        scope.launch { teardown("Disconnected") }
+        teardown("Disconnected")
     }
 
     /**
@@ -259,23 +262,55 @@ class G2Client(
      * timeout exits run on one of them).
      */
     private fun teardown(statusMessage: String) {
-        if (!teardownDone.compareAndSet(false, true)) return
-        running = false
+        serializedTeardown {
+            val announce = teardownDone.compareAndSet(false, true)
+            running = false
+            val self = Thread.currentThread()
+            try {
+                synchronized(stateLock) { state.run = false; state.mox = false }
+                sendHighPriority()
+            } catch (_: Exception) {}
+            keepaliveJob?.cancel()
+            // The socket is what unblocks the receive loop; close it first.
+            socket?.close()
+            receiveThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
+            txSenderThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
+            receiveThread = null
+            txSenderThread = null
+            spectrumWorker?.stop()
+            socket = null
+            if (announce) onConnectionStatusChanged(false, statusMessage)
+        }
+    }
+
+    /** Terminal, reentrant-safe cleanup with one physical owner at a time. */
+    private fun serializedTeardown(block: () -> Unit) {
         val self = Thread.currentThread()
+        var interrupted = false
+        synchronized(teardownLock) {
+            while (teardownOwner != null) {
+                if (
+                    teardownOwner === self ||
+                    receiveThread === self ||
+                    txSenderThread === self
+                ) return
+                try {
+                    teardownLock.wait()
+                } catch (_: InterruptedException) {
+                    interrupted = true
+                }
+            }
+            teardownOwner = self
+        }
         try {
-            synchronized(stateLock) { state.run = false; state.mox = false }
-            sendHighPriority()
-        } catch (_: Exception) {}
-        keepaliveJob?.cancel()
-        // The socket is what unblocks the receive loop; close it first.
-        socket?.close()
-        receiveThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
-        txSenderThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
-        receiveThread = null
-        txSenderThread = null
-        spectrumWorker?.stop()
-        socket = null
-        onConnectionStatusChanged(false, statusMessage)
+            block()
+        } finally {
+            synchronized(teardownLock) {
+                teardownOwner = null
+                teardownLock.notifyAll()
+            }
+            if (interrupted) self.interrupt()
+        }
     }
 
     /**
