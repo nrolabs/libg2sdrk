@@ -939,6 +939,14 @@ class G2Client(
 
     override fun frequencyHz(): Long = synchronized(stateLock) { state.ddcFreqHz[0] }
 
+    override fun rxContext(): com.isaklab.isdrproto.RxContext = synchronized(stateLock) {
+        val active = activeReceiver
+        com.isaklab.isdrproto.RxContext(
+            active, rxStreamMask, state.sampleRate,
+            state.ddcFreqHz.take(state.receiverCount),
+        )
+    }
+
     override fun sampleRateHz(): Int = synchronized(stateLock) { state.sampleRate }
 
     fun setSmoothingFactor(alpha: Float) { fft?.setSmoothingFactor(alpha) }
